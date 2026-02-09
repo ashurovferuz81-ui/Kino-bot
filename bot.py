@@ -1,0 +1,208 @@
+import sqlite3
+import nest_asyncio
+from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+
+nest_asyncio.apply()
+
+TOKEN = "8426836407:AAHoXkQakddqyXZ_olNplG0_ov-3fhvrkSc"
+ADMIN_ID = 5775388579
+
+# ===== DATABASE =====
+conn = sqlite3.connect("ultra_kino.db", check_same_thread=False)
+cur = conn.cursor()
+
+cur.execute("CREATE TABLE IF NOT EXISTS movies(code TEXT PRIMARY KEY, file_id TEXT, name TEXT)")
+cur.execute("CREATE TABLE IF NOT EXISTS channels(channel_id TEXT PRIMARY KEY)")
+cur.execute("CREATE TABLE IF NOT EXISTS users(user_id TEXT PRIMARY KEY)")
+
+conn.commit()
+
+# ===== ADMIN KEYBOARD =====
+def admin_keyboard():
+    keyboard = [
+        ["🎬 Kino qo‘shish", "🗑 Kino o‘chirish"],
+        ["📢 Kanal qo‘shish", "❌ Kanal o‘chirish"],
+        ["👥 Userlar", "📊 Statistika"]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+# ===== CHECK SUB =====
+async def not_subscribed(user_id, context):
+    cur.execute("SELECT channel_id FROM channels")
+    channels = cur.fetchall()
+    not_joined = []
+
+    for ch in channels:
+        channel = ch[0]
+        try:
+            member = await context.bot.get_chat_member(chat_id=channel, user_id=user_id)
+            if member.status in ["left", "kicked"]:
+                not_joined.append(channel)
+        except:
+            not_joined.append(channel)
+
+    return not_joined
+
+# ===== START =====
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+
+    cur.execute("INSERT OR IGNORE INTO users VALUES(?)", (user_id,))
+    conn.commit()
+
+    if update.effective_user.id == ADMIN_ID:
+        await update.message.reply_text("🔥 ADMIN PANEL", reply_markup=admin_keyboard())
+        return
+
+    missing = await not_subscribed(user_id, context)
+
+    if missing:
+        buttons = []
+        for ch in missing:
+            try:
+                chat = await context.bot.get_chat(ch)
+                username = chat.username
+                if username:
+                    url = f"https://t.me/{username}"
+                else:
+                    url = f"https://t.me/+{str(ch).replace('-100','')}"
+            except:
+                url = f"https://t.me/+{str(ch).replace('-100','')}"
+            buttons.append([InlineKeyboardButton("📢 Kanalga kirish", url=url)])
+        buttons.append([InlineKeyboardButton("✅ Obuna bo‘ldim", callback_data="check_sub")])
+        await update.message.reply_text("📢 Kanallarga obuna bo‘ling:", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    await update.message.reply_text("🎬 Kino kodini yuboring:")
+
+# ===== BUTTON =====
+async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    missing = await not_subscribed(query.from_user.id, context)
+    if missing:
+        await query.answer("❌ Hali obuna bo‘lmagansiz!", show_alert=True)
+        return
+    await query.message.edit_text("✅ Endi kino kodini yuboring!")
+
+# ===== VIDEO =====
+async def video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    if context.user_data.get("step") == "video":
+        context.user_data["file"] = update.message.video.file_id
+        context.user_data["step"] = "name"
+        await update.message.reply_text("🎬 Kino nomini yozing:")
+
+# ===== MESSAGES =====
+async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    user_id = update.effective_user.id
+    step = context.user_data.get("step")
+
+    # ===== ADMIN =====
+    if user_id == ADMIN_ID:
+        if text == "🎬 Kino qo‘shish":
+            context.user_data["step"] = "code"
+            await update.message.reply_text("Kino kodini yuboring:")
+            return
+        if step == "code":
+            context.user_data["code"] = text
+            context.user_data["step"] = "video"
+            await update.message.reply_text("Endi videoni yuboring:")
+            return
+        if step == "name":
+            cur.execute(
+                "INSERT OR REPLACE INTO movies VALUES(?,?,?)",
+                (context.user_data["code"], context.user_data["file"], text)
+            )
+            conn.commit()
+            context.user_data.clear()
+            await update.message.reply_text("✅ Kino saqlandi!", reply_markup=admin_keyboard())
+            return
+        # DELETE MOVIE
+        if text == "🗑 Kino o‘chirish":
+            context.user_data["step"] = "del_movie"
+            await update.message.reply_text("O‘chirish uchun kod yuboring:")
+            return
+        if step == "del_movie":
+            cur.execute("DELETE FROM movies WHERE code=?", (text,))
+            conn.commit()
+            context.user_data.clear()
+            await update.message.reply_text("✅ Kino o‘chirildi!", reply_markup=admin_keyboard())
+            return
+        # ADD CHANNEL
+        if text == "📢 Kanal qo‘shish":
+            context.user_data["step"] = "add_channel"
+            await update.message.reply_text("@username / link / private ID yuboring:")
+            return
+        if step == "add_channel":
+            channel_input = text.strip()
+            try:
+                chat = await context.bot.get_chat(channel_input)
+                channel_id = str(chat.id)
+            except:
+                channel_id = channel_input
+            cur.execute("INSERT OR IGNORE INTO channels VALUES(?)", (channel_id,))
+            conn.commit()
+            context.user_data.clear()
+            await update.message.reply_text("✅ Kanal qo‘shildi!", reply_markup=admin_keyboard())
+            return
+        # DELETE CHANNEL
+        if text == "❌ Kanal o‘chirish":
+            context.user_data["step"] = "del_channel"
+            await update.message.reply_text("@username / link / ID yuboring:")
+            return
+        if step == "del_channel":
+            try:
+                chat = await context.bot.get_chat(text)
+                channel_id = str(chat.id)
+            except:
+                channel_id = text
+            cur.execute("DELETE FROM channels WHERE channel_id=?", (channel_id,))
+            conn.commit()
+            context.user_data.clear()
+            await update.message.reply_text("✅ Kanal o‘chirildi!", reply_markup=admin_keyboard())
+            return
+        # STATS
+        if text == "👥 Userlar":
+            cur.execute("SELECT COUNT(*) FROM users")
+            count = cur.fetchone()[0]
+            await update.message.reply_text(f"👥 Userlar: {count}", reply_markup=admin_keyboard())
+            return
+        if text == "📊 Statistika":
+            cur.execute("SELECT COUNT(*) FROM movies")
+            movies = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM channels")
+            channels = cur.fetchone()[0]
+            await update.message.reply_text(
+                f"🎬 Kinolar: {movies}\n📢 Kanallar: {channels}",
+                reply_markup=admin_keyboard()
+            )
+            return
+
+    # ===== USER =====
+    missing = await not_subscribed(user_id, context)
+    if missing:
+        await update.message.reply_text("❌ Avval kanallarga obuna bo‘ling! /start bosing.")
+        return
+    cur.execute("SELECT file_id,name FROM movies WHERE code=?", (text,))
+    movie = cur.fetchone()
+    if movie:
+        await update.message.reply_video(movie[0], caption=f"🎬 {movie[1]}")
+    else:
+        await update.message.reply_text("❌ Kino topilmadi!")
+
+# ===== MAIN =====
+def main():
+    app = ApplicationBuilder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(button, pattern="check_sub"))
+    app.add_handler(MessageHandler(filters.VIDEO, video))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, messages))
+    print("🔥 ULTRA ELITE BOT ISHLADI!")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
